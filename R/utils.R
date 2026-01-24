@@ -21,7 +21,10 @@ required_pkgs <- c(
   "ggplot2",
   "dplyr",
   "tidyr",
-  "igraph"
+  "igraph",
+  "posterior",
+  "doParallel",
+  "progress"
 )
 
 load_or_install(required_pkgs)
@@ -626,7 +629,6 @@ tree_plot <- function(M, mppi) {
 }
 
 tree_plot_minimal <- function(M, mppi, threshold = 0.5, size_node = 10) {
-  # Costruzione degli archi più robusta
   edges <- c()
   for (col in 1:(ncol(M) - 1)) {
     for (row in 1:nrow(M)) {
@@ -736,8 +738,9 @@ calculate_intersection_layout <- function(g, root_node, M) {
 
 
 draw_intersection_edges <- function(g, layout, node_probs, threshold) {
-  edge_list <- ends(g, es = E(g))
-  
+  # edge_list <- ends(g, es = E(g))
+  edge_list <- get.edgelist(g)
+  # print(get.edgelist(g))
   for (i in 1:nrow(edge_list)) {
     from_node <- as.numeric(edge_list[i, 1])
     to_node <- as.numeric(edge_list[i, 2])
@@ -1128,35 +1131,48 @@ log_prior_tree <- function(M, model, pi) {
   return(log_prior)
 }
 
-accept_standard <- function(Xold, Xnew, c, k_new, k_old, y, r21, r12, a0, 
-                            b0, n, log_prior_ratio, gprior = FALSE, g = NULL) {
+accept_standard <- function(Xold, Xnew, Z, c_beta, c_theta, y, r21, r12, a0, 
+                                  b0, n, log_prior_ratio, gprior = FALSE, g = NULL) {
   
-  log_marg <- function(X, gprior, g, c) {
-    if (is.null(X) || ncol(X) == 0) {
-      # modello nullo
-      S <- drop(crossprod(y))
-      return(-(a0 + n/2) * log(b0 + 0.5 * S))
+  log_marg <- function(X_comp, Z, gprior, g, c_beta, c_theta) {
+    term0 <- - (n/2) * log(2 * pi)
+    
+    # Crea matrice design combinata
+    if (is.null(X_comp) || ncol(X_comp) == 0) {
+      if (is.null(Z) || ncol(Z) == 0) {
+        # modello nullo
+        S <- drop(crossprod(y))
+        log_lik <- term0 - (a0 + (n-1)/2) * log(b0 + 0.5 * S)
+        return(log_lik)
+      } else {
+        # Solo non-composizionali
+        X_design <- Z
+        prior_prec <- diag(1/c_theta, ncol(Z))
+      }
+    } else {
+      if (is.null(Z) || ncol(Z) == 0) {
+        # Solo composizionali
+        X_design <- X_comp
+        prior_prec <- diag(1/c_beta, ncol(X_comp))
+      } else {
+        # Entrambi i tipi
+        X_design <- cbind(X_comp, Z)
+        prior_prec <- diag(c(rep(1/c_beta, ncol(X_comp)), rep(1/c_theta, ncol(Z))))
+      }
     }
     
-    k <- ncol(X)
+    k_total <- ncol(X_design)
     
     if (gprior) {
-      # G-PRIOR
-      XtX <- crossprod(X)
-      XtX_inv <- solve(XtX + diag(1e-8, k))
-      beta_ols <- XtX_inv %*% crossprod(X, y)
-      yPy <- drop(crossprod(y, X %*% beta_ols))
-      S <- drop(crossprod(y)) - (g/(g+1)) * yPy
-      return(-0.5 * k * log(1+g) - (a0 + n/2) * log(b0 + 0.5 * S))
+      # G-PRIOR (solo per parte composizionale)
+      # Per semplicità, assumiamo g-prior solo per composizionali, ridge per non-composizionali
+      stop("G-prior not implemented for mixed compositional/non-compositional case")
     } else {
-      # ridge prior
-      XtX <- crossprod(X)
-      XtY <- crossprod(X, y)
+      # ridge prior per tutti i coefficienti
+      XtX <- crossprod(X_design)
+      XtY <- crossprod(X_design, y)
       
-      # V0^{-1} = (cI)^{-1} = (1/c)I
-      V0_inv <- diag(1/c, k)
-      
-      # V_{nγ} = (X'X + V0^{-1})^{-1}
+      V0_inv <- prior_prec
       Vn_inv <- XtX + V0_inv
       
       tryCatch({
@@ -1165,20 +1181,26 @@ accept_standard <- function(Xold, Xnew, c, k_new, k_old, y, r21, r12, a0,
         Vn <- chol2inv(Vn_inv_chol)
         
         mn <- Vn %*% XtY
-        
-        # b_n
         yty <- drop(crossprod(y))
         m0V0m0 <- 0  # m_0 = 0
         mnVnmn <- drop(t(mn) %*% Vn_inv %*% mn)
         bn <- b0 + 0.5 * (yty + m0V0m0 - mnVnmn)
         
-        log_det_V0 <- k * log(c)  # |V_{0γ}| = c^k
-        log_det_Vn <- -log_det_Vn_inv  # |V_{nγ}| = 1/|V_{nγ}^{-1}|
+        # Log-determinante della prior
+        if (is.null(X_comp) || ncol(X_comp) == 0) {
+          log_det_V0 <- ncol(Z) * log(c_theta)
+        } else if (is.null(Z) || ncol(Z) == 0) {
+          log_det_V0 <- ncol(X_comp) * log(c_beta)
+        } else {
+          log_det_V0 <- ncol(X_comp) * log(c_beta) + ncol(Z) * log(c_theta)
+        }
+        
+        log_det_Vn <- -log_det_Vn_inv
         
         term1 <- 0.5 * (log_det_Vn - log_det_V0)
-        term2 <- -(a0 + n/2) * log(bn)
+        term2 <- -(a0 + (n-1)/2) * log(bn)
         
-        return(term1 + term2)
+        return(term0 + term1 + term2)
         
       }, error = function(e) {
         return(-Inf)
@@ -1186,13 +1208,78 @@ accept_standard <- function(Xold, Xnew, c, k_new, k_old, y, r21, r12, a0,
     }
   }
   
-  log_post_old <- log_marg(Xold, gprior, g, c)
-  log_post_new <- log_marg(Xnew, gprior, g, c)
+  log_post_old <- log_marg(Xold, Z, gprior, g, c_beta, c_theta)
+  log_post_new <- log_marg(Xnew, Z, gprior, g, c_beta, c_theta)
   
   log_accept <- (log_post_new - log_post_old) + (log(r21) - log(r12)) + log_prior_ratio
   
-  return(log_accept)
+  return(min(log_accept, 700))
 }
+
+# accept_standard <- function(Xold, Xnew, c, y, r21, r12, a0, 
+#                             b0, n, log_prior_ratio, gprior = FALSE, g = NULL) {
+#   
+#   log_marg <- function(X, gprior, g, c) {
+#     term0 <- - (n/2) * log(2 * pi)
+#     
+#     if (is.null(X) || ncol(X) == 0) {
+#       # modello nullo
+#       S <- drop(crossprod(y))
+#       log_lik <- term0 - (a0 + (n-1)/2) * log(b0 + 0.5 * S)
+#       return(log_lik)
+#     }
+#     
+#     k <- ncol(X)
+#     
+#     if (gprior) {
+#       # G-PRIOR
+#       XtX <- crossprod(X)
+#       XtX_inv <- solve(XtX + diag(1e-8, k))
+#       beta_ols <- XtX_inv %*% crossprod(X, y)
+#       yPy <- drop(crossprod(y, X %*% beta_ols))
+#       S <- drop(crossprod(y)) - (g/(g+1)) * yPy
+#       log_lik <- term0 - 0.5 * k * log(1+g) - (a0 + (n-1)/2) * log(b0 + 0.5 * S)
+#       return(log_lik)
+#     } else {
+#       # ridge prior
+#       XtX <- crossprod(X)
+#       XtY <- crossprod(X, y)
+#       
+#       V0_inv <- diag(1/c, k)
+#       Vn_inv <- XtX + V0_inv
+#       
+#       tryCatch({
+#         Vn_inv_chol <- chol(Vn_inv)
+#         log_det_Vn_inv <- 2 * sum(log(diag(Vn_inv_chol)))
+#         Vn <- chol2inv(Vn_inv_chol)
+#         
+#         mn <- Vn %*% XtY
+#         yty <- drop(crossprod(y))
+#         m0V0m0 <- 0  # m_0 = 0
+#         mnVnmn <- drop(t(mn) %*% Vn_inv %*% mn)
+#         bn <- b0 + 0.5 * (yty + m0V0m0 - mnVnmn)
+#         
+#         log_det_V0 <- k * log(c)
+#         log_det_Vn <- -log_det_Vn_inv
+#         
+#         term1 <- 0.5 * (log_det_Vn - log_det_V0)
+#         term2 <- -(a0 + (n-1)/2) * log(bn)
+#         
+#         return(term0 + term1 + term2)
+#         
+#       }, error = function(e) {
+#         return(-Inf)
+#       })
+#     }
+#   }
+#   
+#   log_post_old <- log_marg(Xold, gprior, g, c)
+#   log_post_new <- log_marg(Xnew, gprior, g, c)
+#   
+#   log_accept <- (log_post_new - log_post_old) + (log(r21) - log(r12)) + log_prior_ratio
+#   
+#   return(min(log_accept, 700))
+# }
 
 fun_adaptive_moves <- function(depth, lambda) {
   if (lambda > 0) {
@@ -1324,11 +1411,25 @@ relativeShiftMCMC_gaussian <- function(y, X, Z = NULL, A, M, priors = c(5.0, 10.
   it <- 1
   betmodelac <- 0
   start_time <- proc.time()
+  
+  # LOADING BAR
+  pb <- progress::progress_bar$new(
+    format = "  MCMC Progress [:bar] :percent | ETA: :eta | Elapsed: :elapsed | Acceptance: :acc_rate",
+    total = num_iter, 
+    clear = FALSE,
+    width = 80,
+    show_after = 0
+  )
+  
   # 3. MCMC LOOP ---------------------------------------------------------------
   for (t in 1:num_iter) {
-    if ((t %% 500) == 0) {
-      cat("Iteration:", t, "Acceptance rate:", round(betmodelac/t, 4), "\n")
-    }
+    
+    pb$tick(tokens = list(acc_rate = sprintf("%.3f", betmodelac/max(1, t-1))))
+    
+    
+    # if ((t %% 500) == 0) {
+    #   cat("Iteration:", t, "Acceptance rate:", round(betmodelac/t, 4), "\n")
+    # }
     
     # a. Residual for compositional covariates
     if (p_theta > 0) {
@@ -1394,9 +1495,12 @@ relativeShiftMCMC_gaussian <- function(y, X, Z = NULL, A, M, priors = c(5.0, 10.
     log_prior_ratio <- log_prior_new - log_prior_old
     
     # f. Acceptance log-probability
-    acceptMH <- accept_standard(Xsel, Xselnew, c_beta, newk, k, y_res, 
+    acceptMH <- accept_standard(Xsel, Xselnew, Z, c_beta, c_theta, y, 
                                 r21, r12, a_sigma, b_sigma, n, log_prior_ratio,
                                 gprior, g)
+    # acceptMH <- accept_standard(Xsel, Xselnew, c_beta, y_res, 
+    #                             r21, r12, a_sigma, b_sigma, n, log_prior_ratio,
+    #                             gprior, g)
     
     if (proposal_ratio != 1) {
       acceptMH <- acceptMH + log(proposal_ratio)
@@ -1404,7 +1508,7 @@ relativeShiftMCMC_gaussian <- function(y, X, Z = NULL, A, M, priors = c(5.0, 10.
     
     acceptMH <- exp(min(acceptMH, 700))
     u <- runif(1)
-    
+
     # g. Accept or reject the new model
     if (u <= acceptMH) {
       model <- proposemodel 
@@ -1460,21 +1564,21 @@ relativeShiftMCMC_gaussian <- function(y, X, Z = NULL, A, M, priors = c(5.0, 10.
         post_var <- (g/(g+1)) * sigma * XtX_inv
         beta_temp <- mvtnorm::rmvnorm(1, drop(post_mean), post_var)
         
-        yPy <- drop(crossprod(y_res, Xsel_leaf %*% beta_ols))
-        S <- drop(crossprod(y_res)) - (g/(g+1)) * yPy
-        an <- a_sigma + n/2
-        bn <- b_sigma + 0.5 * S
-        sigma <- 1 / rgamma(1, an, bn)
+        # yPy <- drop(crossprod(y_res, Xsel_leaf %*% beta_ols))
+        # S <- drop(crossprod(y_res)) - (g/(g+1)) * yPy
+        # an <- a_sigma + n/2
+        # bn <- b_sigma + 0.5 * S
+        # sigma <- 1 / rgamma(1, an, bn)
       } else {
         post_var <- solve(XtX + diag(1 / c_beta, k_leaf))
         post_mean <- post_var %*% Xty
         beta_temp <- mvtnorm::rmvnorm(1, drop(post_mean), post_var * sigma)
         
-        RSS <- sum((y_res - Xsel_leaf %*% post_mean)^2)
-        penalty <- (1 / c_beta) * sum(post_mean^2)
-        an <- a_sigma + n / 2
-        bn <- b_sigma + 0.5 * (RSS + penalty)
-        sigma <- 1 / rgamma(1, an, bn)
+        # RSS <- sum((y_res - Xsel_leaf %*% post_mean)^2)
+        # penalty <- (1 / c_beta) * sum(post_mean^2)
+        # an <- a_sigma + (n-1) / 2
+        # bn <- b_sigma + 0.5 * (RSS + penalty)
+        # sigma <- 1 / rgamma(1, an, bn)
       }
       
       beta <- rep(0, d)
@@ -1505,15 +1609,56 @@ relativeShiftMCMC_gaussian <- function(y, X, Z = NULL, A, M, priors = c(5.0, 10.
         post_mean_theta <- post_var_theta %*% (t(Z) %*% y_res_theta / sigma)
         theta <- mvtnorm::rmvnorm(1, post_mean_theta, post_var_theta)
         
-        an <- a_sigma + n / 2
-        bn <- b_sigma + 0.5 * sum((y - Z %*% theta)^2)
-        sigma <- 1 / rgamma(1, an, bn)
-        
+        # an <- a_sigma + n / 2
+        # bn <- b_sigma + 0.5 * sum((y - Z %*% theta)^2)
+        # sigma <- 1 / rgamma(1, an, bn)
+        # 
+        # ll_out[t] <- loglikelihood(y, Z %*% t(theta), sigma)
+      } 
+      # else {
+      #   an <- a_sigma + n / 2
+      #   bn <- b_sigma + 0.5 * sum(y^2)
+      #   sigma <- 1 / rgamma(1, an, bn)
+      #   ll_out[t] <- loglikelihood(y, rep(0, n), sigma)
+      # }
+    }
+    
+    if (k_leaf > 0) {
+      if (p_theta > 0) {
+        RSS <- sum((y - X[, l_leaf, drop = FALSE] %*% t(beta_temp) - Z %*% t(theta))^2)
+        penalty_beta <- ifelse(gprior, 0, (1/c_beta) * sum(beta_temp^2))
+        penalty_theta <- (1/c_theta) * sum(theta^2)
+      } else {
+        RSS <- sum((y - X[, l_leaf, drop = FALSE] %*% t(beta_temp))^2)
+        penalty_beta <- ifelse(gprior, 0, (1/c_beta) * sum(beta_temp^2))
+        penalty_theta <- 0
+      }
+    } else {
+      if (p_theta > 0) {
+        RSS <- sum((y - Z %*% t(theta))^2)
+        penalty_beta <- 0
+        penalty_theta <- (1/c_theta) * sum(theta^2)
+      } else {
+        RSS <- sum(y^2)
+        penalty_beta <- 0
+        penalty_theta <- 0
+      }
+    }
+    
+    an <- a_sigma + (n + k_leaf + p_theta) / 2
+    bn <- b_sigma + 0.5 * (RSS + penalty_beta + penalty_theta)
+    sigma <- 1 / rgamma(1, an, bn)
+    
+    if (k_leaf > 0) {
+      if (p_theta > 0) {
+        ll_out[t] <- loglikelihood(y, X[, l_leaf, drop = FALSE] %*% t(beta_temp) + Z %*% t(theta), sigma)
+      } else {
+        ll_out[t] <- loglikelihood(y, X[, l_leaf, drop = FALSE] %*% t(beta_temp), sigma)
+      }
+    } else {
+      if (p_theta > 0) {
         ll_out[t] <- loglikelihood(y, Z %*% t(theta), sigma)
       } else {
-        an <- a_sigma + n / 2
-        bn <- b_sigma + 0.5 * sum(y^2)
-        sigma <- 1 / rgamma(1, an, bn)
         ll_out[t] <- loglikelihood(y, rep(0, n), sigma)
       }
     }
@@ -1553,6 +1698,8 @@ relativeShiftMCMC_gaussian <- function(y, X, Z = NULL, A, M, priors = c(5.0, 10.
   # 4. FINAL RESULTS --------------------------------------------------------
   total_time <- proc.time() - start_time
   
+  pb$terminate()
+  
   return(list(
     model = model_out, 
     model_leaf = model_out_leaf, 
@@ -1578,6 +1725,109 @@ relativeShiftMCMC_gaussian <- function(y, X, Z = NULL, A, M, priors = c(5.0, 10.
 }
 
 
+run_multiple_chains <- function(y, X, Z = NULL, A, M, priors = c(5.0, 10.0, 2.0, 2.0, 1.0, 1.0),
+                                N = 1, num_iter, num_burn, num_thin, 
+                                method = "OLS", gprior = FALSE, g = NULL,
+                                adaptive_levels = TRUE, tau = 0.5, kappa = 1,
+                                adaptive_moves = TRUE, lambda = 1,
+                                n_chains, parallel = TRUE, train_prop = 0.8, seed = NULL) {
+  
+  # Load required libraries
+  if (!require(posterior)) install.packages("posterior")
+  if (!require(doParallel)) install.packages("doParallel")
+  library(posterior)
+  library(doParallel)
+  
+  # Set up parallel backend
+  if (parallel) {
+    n_cores <- min(n_chains, detectCores() - 1)
+    cl <- makeCluster(n_cores)
+    registerDoParallel(cl)
+    on.exit(stopCluster(cl))
+  }
+  
+  # Run chains in parallel or sequentially
+  chains <- foreach(i = 1:n_chains, .combine = 'c', .packages = c("mvtnorm", "MASS")) %dopar% {
+    # Set unique seed for each chain
+    chain_seed <- if (!is.null(seed)) seed + i else NULL
+    
+    # Split data into training and test sets for this chain
+    n <- nrow(X)
+    n_train <- floor(train_prop * n)
+    train_indices <- sample(1:n, n_train)
+    
+    X_train <- X[train_indices, , drop = FALSE]
+    y_train <- y[train_indices]
+    X_test <- X[-train_indices, , drop = FALSE]
+    y_test <- y[-train_indices]
+    
+    if (!is.null(Z)) {
+      Z_train <- Z[train_indices, , drop = FALSE]
+      Z_test <- Z[-train_indices, , drop = FALSE]
+    } else {
+      Z_train <- NULL
+      Z_test <- NULL
+    }
+    
+    # Run MCMC on training data
+    result <- relativeShiftMCMC_gaussian(
+      y = y_train, X = X_train, Z = Z_train, A = A, M = M, priors = priors,
+      N = N, num_iter = num_iter, num_burn = num_burn, num_thin = num_thin,
+      Xnew = X_test, Znew = Z_test, method = method,
+      seed = chain_seed, gprior = gprior, g = g,
+      adaptive_levels = adaptive_levels, tau = tau, kappa = kappa,
+      adaptive_moves = adaptive_moves, lambda = lambda
+    )
+    
+    # Add test data and predictions to results
+    result$X_test <- X_test
+    result$y_test <- y_test
+    result$Z_test <- Z_test
+    
+    list(result)
+  }
+  
+  # Extract parameter samples from each chain
+  extract_samples <- function(chain, param) {
+    switch(param,
+           "beta" = chain$beta,
+           "theta" = chain$theta,
+           "sigma" = chain$sigma)
+  }
+  
+  params <- c("beta", "theta", "sigma")
+  samples_list <- lapply(params, function(p) {
+    lapply(chains, function(chain) extract_samples(chain, p))
+  })
+  names(samples_list) <- params
+  
+  # Compute Rhat and ESS for each parameter
+  compute_diagnostics <- function(samples) {
+    n_iter <- nrow(samples[[1]])
+    n_params <- ifelse(is.matrix(samples[[1]]), ncol(samples[[1]]), 1)
+    samples_array <- array(NA, dim = c(n_iter, n_chains, n_params))
+    
+    for (chain in 1:n_chains) {
+      if (n_params > 1) {
+        samples_array[, chain, ] <- as.matrix(samples[[chain]])
+      } else {
+        samples_array[, chain, 1] <- samples[[chain]]
+      }
+    }
+    
+    draws <- posterior::as_draws_array(samples_array)
+    rhat <- posterior::rhat(draws)
+    ess <- posterior::ess_bulk(draws)
+    
+    list(rhat = rhat, ess = ess)
+  }
+  
+  diagnostics <- lapply(samples_list, compute_diagnostics)
+  
+  return(list(chains = chains, diagnostics = diagnostics))
+}
+
+
 rpolya_gamma <- function(n, b, c) {
   if (!requireNamespace("BayesLogit", quietly = TRUE)) {
     stop("Package 'BayesLogit' is required for Polya-Gamma sampling")
@@ -1585,55 +1835,108 @@ rpolya_gamma <- function(n, b, c) {
   BayesLogit::rpg(n, b, c)
 }
 
-accept_binary <- function(Xold, Xnew, c, k_new, k_old, kappa, r21, r12, 
+accept_binary <- function(Xold, Xnew, c, kappa_pg, r21, r12, 
                           log_prior_ratio, omega_pg) {
   
-  log_marg_binary <- function(X, kappa, omega_pg, c) {
+  log_marg_binary <- function(X, kappa_pg, omega_pg, c) {
+    n <- length(kappa_pg)
+    
+    # Controllo stabilità omega_pg
+    if (any(omega_pg <= 1e-12) || any(!is.finite(omega_pg)) || any(omega_pg > 1e12)) {
+      return(-Inf)
+    }
+    
+    # Termini comuni
+    term1 <- -0.5 * sum(kappa_pg^2 / omega_pg)
+    term5 <- -0.5 * sum(log(omega_pg))
+    
+    # MODELLO NULLO
     if (is.null(X) || ncol(X) == 0) {
-      return(-0.5 * sum(kappa^2 / omega_pg) - 0.5 * sum(log(omega_pg)))
+      return(term1 + term5)
     }
     
     k <- ncol(X)
-    XtOmega <- t(X) %*% diag(omega_pg)
-    Sigma_inv <- XtOmega %*% X + diag(1/c, k)
     
+    # MODELLO CON COVARIATE
     tryCatch({
-      Sigma_chol <- chol(Sigma_inv)
-      log_det_Sigma <- 2 * sum(log(diag(Sigma_chol))) 
+      # Usa scaling per stabilità
+      X_scaled <- X * sqrt(omega_pg)
+      XtWX <- crossprod(X_scaled)
+      Sigma_inv <- XtWX + diag(1/c, k)
+      
+      # Stabilizzazione con controllo autovalori
+      eigen_vals <- eigen(Sigma_inv, symmetric = TRUE, only.values = TRUE)$values
+      min_eigen <- min(eigen_vals)
+      
+      if (min_eigen <= 1e-8) {
+        jitter_amount <- max(abs(min_eigen) + 1e-6, 1e-8)
+        diag(Sigma_inv) <- diag(Sigma_inv) + jitter_amount
+      }
+      
+      # Cholesky decomposition
+      Sigma_chol <- tryCatch({
+        chol(Sigma_inv)
+      }, error = function(e) {
+        # Se fallisce, usa decomposizione spettrale
+        eig <- eigen(Sigma_inv, symmetric = TRUE)
+        eig$values[eig$values < 1e-10] <- 1e-10
+        Sigma_inv_fixed <- eig$vectors %*% diag(eig$values) %*% t(eig$vectors)
+        chol(Sigma_inv_fixed)
+      })
+      
+      log_det_Sigma_inv <- 2 * sum(log(diag(Sigma_chol)))
       Sigma <- chol2inv(Sigma_chol)
       
-      mu <- Sigma %*% (t(X) %*% kappa)
+      # Calcolo di mu (più stabile)
+      XtK <- crossprod(X, kappa_pg)
+      mu <- Sigma %*% XtK
       
-      term1 <- -0.5 * sum(kappa^2 / omega_pg)
-      term2 <- 0.5 * (t(mu) %*% Sigma_inv %*% mu)[1,1]
-      term3 <- -0.5 * log_det_Sigma
-      term4 <- -0.5 * sum(log(omega_pg))
-      term5 <- -0.5 * k * log(2 * pi) 
+      # CORREZIONE IMPORTANTE: term2 corretto
+      term2 <- 0.5 * as.numeric(crossprod(mu, XtK))
+      term3 <- 0.5 * log_det_Sigma_inv          
+      term4 <- -0.5 * k * log(c)                
       
-      return(term1 + term2 + term3 + term4 + term5)
+      log_marg <- term1 + term2 + term3 + term4 + term5
+      
+      if (!is.finite(log_marg)) {
+        return(-Inf)
+      }
+      
+      return(log_marg)
+      
     }, error = function(e) {
       return(-Inf)
     })
   }
   
-  log_post_old <- log_marg_binary(Xold, kappa, omega_pg, c)
-  log_post_new <- log_marg_binary(Xnew, kappa, omega_pg, c)
+  log_post_old <- log_marg_binary(Xold, kappa_pg, omega_pg, c)
+  log_post_new <- log_marg_binary(Xnew, kappa_pg, omega_pg, c)
   
-  if (is.infinite(log_post_old) || is.infinite(log_post_new)) {
+  # Gestione -Inf
+  if (is.infinite(log_post_old) && is.infinite(log_post_new)) {
+    return(-Inf)
+  }
+  
+  if (is.infinite(log_post_old)) {
+    return(Inf)
+  }
+  
+  if (is.infinite(log_post_new)) {
     return(-Inf)
   }
   
   log_accept <- (log_post_new - log_post_old) + (log(r21) - log(r12)) + log_prior_ratio
   
-  return(log_accept)
+  # Clipping per stabilità
+  return(pmax(pmin(log_accept, 700), -700))
 }
 
 
-relativeShiftMCMC_binomial <- function(y, X, Z = NULL, A, M, priors = c(5.0, 10.0, 1.0), 
+relativeShiftMCMC_binomial <- function(y, X, Z = NULL, A, M, priors = c(5.0, 10.0, 1.0, 1.0), 
                                        N = 1, num_iter, num_burn, num_thin, 
                                        Xnew = NULL, Znew = NULL,
                                        seed = NULL, 
-                                       adaptive_levels = TRUE, tau = 0.5, alpha_max = 1,
+                                       adaptive_levels = TRUE, tau = 0.5, kappa = 1,
                                        adaptive_moves = TRUE, lambda = 1) {
   
   # 1. PARAMETERS INITIALISATION -----------------------------------------------
@@ -1645,7 +1948,6 @@ relativeShiftMCMC_binomial <- function(y, X, Z = NULL, A, M, priors = c(5.0, 10.
   
   n <- nrow(X)
   d <- ncol(X)
-  
   
   # IF Z = NULL
   if (is.null(Z)) {
@@ -1660,20 +1962,23 @@ relativeShiftMCMC_binomial <- function(y, X, Z = NULL, A, M, priors = c(5.0, 10.
   c_beta <- priors[1]
   c_theta <- priors[2]
   alpha0 <- priors[3] 
+  beta0 <- priors[4]
   
   # INITIALISATION FROM PRIOR
   if (adaptive_levels) {
-    alpha0_vec <- compute_alpha0_nodes(M, tau = tau, alpha_max = alpha_max)
+    betaPrior_vec <- compute_BetaPrior_nodes(M, tau = tau, kappa = kappa)
+    alpha0_vec <- betaPrior_vec[[1]]
+    beta0_vec <- betaPrior_vec[[2]]
   } else {
     alpha0_vec <- rep(alpha0, d)
+    beta0_vec <- rep(beta0, d)
   }
-  
-  beta0_vec <- 2 - alpha0_vec
+
   pi <- sapply(1:d, function(i) rbeta(1, alpha0_vec[i], beta0_vec[i]))
   
   # INITIALISATION THETA NON-COMPOSITIONAL COVARIATES
   if (p_theta > 0) {
-    theta <- rnorm(p_theta, 0, sqrt(c_theta))
+    theta <- matrix(rnorm(p_theta, 0, sqrt(c_theta)), ncol = 1)
   } else {
     theta <- numeric(0)
   }
@@ -1688,7 +1993,10 @@ relativeShiftMCMC_binomial <- function(y, X, Z = NULL, A, M, priors = c(5.0, 10.
   
   # INITIALISATION BETA COMPOSITIONAL COVARIATES
   Xsel <- X[, l, drop = FALSE]
-  beta <- rnorm(d, mean = 0, sd = sqrt(c_beta))
+  beta <- matrix(0, nrow = d, ncol = 1)  
+  if (length(l) > 0) {
+    beta[l, 1] <- rnorm(length(l), mean = 0, sd = sqrt(c_beta)) 
+  }
   
   # INITIALISATION POLYA-GAMMA
   if (p_theta > 0) {
@@ -1696,19 +2004,23 @@ relativeShiftMCMC_binomial <- function(y, X, Z = NULL, A, M, priors = c(5.0, 10.
   } else {
     eta_init <- X %*% beta
   }
-  omega_pg <- rpolya_gamma(n, 1, eta_init)
-  kappa <- y - 0.5
+  
+  if (!requireNamespace("BayesLogit", quietly = TRUE)) {
+    stop("Package 'BayesLogit' required for Polya-Gamma sampling")
+  }
+  omega_pg <- BayesLogit::rpg(n, 1, as.vector(eta_init))
+  kappa_pg <- y - 0.5
   
   # MOVE COUNTER
   resMove <- move_tree(A_curr, M_curr, M_fix, N, move = "delete")
   numAdd_curr <- resMove[[5]]
   numDelete_curr <- resMove[[6]]
   
-  # 2. SETUP STORAGE -----------------------------------------------------------
+  # 2. SETUP STORAGE
   num_samples <- as.integer(floor((num_iter - num_burn) / num_thin))
   model_out <- model_out_leaf <- beta_out <- matrix(0, nrow = num_samples, ncol = d)
   if (p_theta > 0) {
-    theta_out <- matrix(0, nrow = p_theta, ncol = num_samples)
+    theta_out <- matrix(0, nrow = num_samples, ncol = p_theta)  # num_samples x p_theta
   } else {
     theta_out <- NULL
   }
@@ -1728,20 +2040,28 @@ relativeShiftMCMC_binomial <- function(y, X, Z = NULL, A, M, priors = c(5.0, 10.
   betmodelac <- 0
   start_time <- proc.time()
   
+  # LOADING BAR
+  pb <- progress::progress_bar$new(
+    format = "  MCMC Progress [:bar] :percent | ETA: :eta | Elapsed: :elapsed | Acceptance: :acc_rate",
+    total = num_iter, 
+    clear = FALSE,
+    width = 80,
+    show_after = 0
+  )
+  
   # 3. MCMC LOOP ---------------------------------------------------------------
   for (t in 1:num_iter) {
-    if ((t %% 500) == 0) {
-      cat("Iteration:", t, "Acceptance rate:", round(betmodelac/t, 4), "\n")
-    }
+    
+    pb$tick(tokens = list(acc_rate = sprintf("%.3f", betmodelac/max(1, t-1))))
     
     # a. Update Polya-Gamma variables
     if (p_theta > 0) {
-      eta <- X %*% beta + Z %*% theta
+      eta <- as.vector(X %*% beta + Z %*% theta)
     } else {
-      eta <- X %*% beta
+      eta <- as.vector(X %*% beta)
     }
-    omega_pg <- rpolya_gamma(n, 1, eta)
-    kappa <- y - 0.5
+    omega_pg <- BayesLogit::rpg(n, 1, eta)
+    kappa_pg <- y - 0.5
     
     # b. New move proposal for compositional covariates
     if (adaptive_moves) {
@@ -1800,7 +2120,7 @@ relativeShiftMCMC_binomial <- function(y, X, Z = NULL, A, M, priors = c(5.0, 10.
     log_prior_ratio <- log_prior_new - log_prior_old
     
     # f. Acceptance log-probability
-    acceptMH <- accept_binary(Xsel, Xselnew, c_beta, newk, k, kappa, 
+    acceptMH <- accept_binary(Xsel, Xselnew, c_beta, kappa_pg, 
                               r21, r12, log_prior_ratio, omega_pg)
     
     if (proposal_ratio != 1) {
@@ -1825,7 +2145,7 @@ relativeShiftMCMC_binomial <- function(y, X, Z = NULL, A, M, priors = c(5.0, 10.
         metric <- metric_prop
       }
     }
-
+    
     # h. Update pi
     for (i in 1:d) {
       parent <- get_parent(M_fix, i)
@@ -1854,67 +2174,97 @@ relativeShiftMCMC_binomial <- function(y, X, Z = NULL, A, M, priors = c(5.0, 10.
     if (k_leaf > 0) {
       Xsel_leaf <- X[, l_leaf, drop = FALSE]
       
-      # Update beta (Compositional Covariate)
+      # Prepara residui
       if (p_theta > 0) {
-        kappa_res <- kappa - Z %*% theta
+        kappa_res_pg <- kappa_pg - as.vector(Z %*% theta)
       } else {
-        kappa_res <- kappa
+        kappa_res_pg <- kappa_pg
       }
       
-      XtOmega <- t(Xsel_leaf) %*% diag(omega_pg)
-      Sigma_inv <- XtOmega %*% Xsel_leaf + diag(1 / c_beta, k_leaf)
+      # Aggiornamento beta con gestione robusta
+      tryCatch({
+        X_scaled <- Xsel_leaf * sqrt(omega_pg)
+        XtWX <- crossprod(X_scaled)
+        Sigma_inv <- XtWX + diag(1 / c_beta, k_leaf)
+        
+        # Stabilizzazione
+        diag(Sigma_inv) <- diag(Sigma_inv) + 1e-8
+        
+        # Decomposizione spettrale
+        eigen_decomp <- eigen(Sigma_inv, symmetric = TRUE)
+        eigen_values <- pmax(eigen_decomp$values, 1e-10)  # Forza positività
+        eigen_vectors <- eigen_decomp$vectors
+        
+        # Calcola Sigma in modo stabile
+        Sigma <- eigen_vectors %*% diag(1/eigen_values) %*% t(eigen_vectors)
+        
+        # Media posteriore
+        XtK <- crossprod(Xsel_leaf, kappa_res_pg)
+        mu <- Sigma %*% XtK
+        
+        # Campionamento: usa L = V * D^(-1/2) dove Sigma = V * D^(-1) * V'
+        z <- rnorm(k_leaf)
+        L <- eigen_vectors %*% diag(1/sqrt(eigen_values))
+        beta_temp <- as.vector(mu) + as.vector(L %*% z) 
+        
+        # Assegna a beta completo
+        beta <- matrix(0, nrow = d, ncol = 1) 
+        beta[l_leaf, 1] <- beta_temp
+        
+      }, error = function(e) {
+        # Fallback: usa il modello precedente
+        warning(sprintf("Errore aggiornamento beta (iter %d): %s", t, e$message))
+      })
       
-      Sigma_inv <- Sigma_inv + diag(1e-8, k_leaf) 
-      
-      Sigma_chol <- chol(Sigma_inv)
-      Sigma <- chol2inv(Sigma_chol)
-      mu <- Sigma %*% (t(Xsel_leaf) %*% kappa_res)
-      
-      beta_temp <- mvtnorm::rmvnorm(1, drop(mu), Sigma)
-      beta <- rep(0, d)
-      beta[l_leaf] <- beta_temp
-      
-      # Update theta (Non-Compositional Covariate) - only if Z is not NULL
+      # Aggiornamento theta
       if (p_theta > 0) {
-        kappa_theta <- kappa - X %*% beta
-        ZtOmega <- t(Z) %*% diag(omega_pg)
-        Sigma_inv_theta <- ZtOmega %*% Z + diag(1/c_theta, p_theta)
+        kappa_theta_pg <- kappa_pg - as.vector(X %*% beta)
         
-        Sigma_inv_theta <- Sigma_inv_theta + diag(1e-8, p_theta)
-        
-        Sigma_theta_chol <- chol(Sigma_inv_theta)
-        Sigma_theta <- chol2inv(Sigma_theta_chol)
-        mu_theta <- Sigma_theta %*% (t(Z) %*% kappa_theta)
-        theta <- mvtnorm::rmvnorm(1, drop(mu_theta), Sigma_theta)
+        tryCatch({
+          ZtW <- t(Z) * omega_pg
+          Sigma_inv_theta <- ZtW %*% Z + diag(1/c_theta, p_theta)
+          Sigma_inv_theta <- Sigma_inv_theta + diag(1e-8, p_theta)
+          Sigma_theta_chol <- chol(Sigma_inv_theta)
+          Sigma_theta <- chol2inv(Sigma_theta_chol)
+          mu_theta <- Sigma_theta %*% (t(Z) %*% kappa_theta_pg)
+          theta <- matrix(mvtnorm::rmvnorm(1, drop(mu_theta), Sigma_theta), ncol = 1)
+        }, error = function(e) {
+          warning(sprintf("Errore aggiornamento theta (iter %d): %s", t, e$message))
+        })
       }
       
-      
-      # log-likelihood
+      # Log-likelihood con clipping
       if (p_theta > 0) {
-        eta <- X[, l_leaf, drop = FALSE] %*% t(beta_temp) + Z %*% t(theta)
+        eta <- as.vector(Xsel_leaf %*% beta_temp + Z %*% theta)
       } else {
-        eta <- X[, l_leaf, drop = FALSE] %*% t(beta_temp)
+        eta <- as.vector(Xsel_leaf %*% beta_temp)
       }
+      eta <- pmin(pmax(eta, -20), 20)
       ll_out[t] <- sum(y * eta - log1p(exp(eta)))
+      
     } else {
-      # Empty model for compositional covariates
-      # Update theta (non-compositional) for binary models
+      # Modello vuoto per covariate composizionali
+      beta <- matrix(0, nrow = d, ncol = 1)
+      
       if (p_theta > 0) {
-        kappa_theta <- kappa
-        ZtOmega <- t(Z) %*% diag(omega_pg)
-        Sigma_inv_theta <- ZtOmega %*% Z + diag(1/c_theta, p_theta)
-        
-        Sigma_inv_theta <- Sigma_inv_theta + diag(1e-8, p_theta)
-        
-        Sigma_theta_chol <- chol(Sigma_inv_theta)
-        Sigma_theta <- chol2inv(Sigma_theta_chol)
-        mu_theta <- Sigma_theta %*% (t(Z) %*% kappa_theta)
-        theta <- mvtnorm::rmvnorm(1, drop(mu_theta), Sigma_theta)
-        
-        eta_theta <- Z %*% t(theta)
-        ll_out[t] <- sum(y * eta_theta - log1p(exp(eta_theta)))
+        kappa_theta_pg <- kappa_pg
+        tryCatch({
+          ZtW <- t(Z) * omega_pg
+          Sigma_inv_theta <- ZtW %*% Z + diag(1/c_theta, p_theta)
+          Sigma_inv_theta <- Sigma_inv_theta + diag(1e-8, p_theta)
+          Sigma_theta_chol <- chol(Sigma_inv_theta)
+          Sigma_theta <- chol2inv(Sigma_theta_chol)
+          mu_theta <- Sigma_theta %*% (t(Z) %*% kappa_theta_pg)
+          theta <- matrix(mvtnorm::rmvnorm(1, drop(mu_theta), Sigma_theta), ncol = 1)
+          
+          eta_theta <- as.vector(Z %*% theta)
+          eta_theta <- pmin(pmax(eta_theta, -20), 20)
+          ll_out[t] <- sum(y * eta_theta - log1p(exp(eta_theta)))
+        }, error = function(e) {
+          ll_out[t] <- sum(y * 0 - log1p(exp(0)))
+        })
       } else {
-        ll_out[t] <- sum(y * 0 - log1p(exp(0)))
+        ll_out[t] <- sum(y * 0 - log1p(exp(0)))  # modello nullo
       }
     }
     
@@ -1922,9 +2272,9 @@ relativeShiftMCMC_binomial <- function(y, X, Z = NULL, A, M, priors = c(5.0, 10.
     if ((t > num_burn) & (t %% num_thin) == 0) {
       model_out[it, ] <- model
       model_out_leaf[it, ] <- leaf_model
-      beta_out[it, ] <- beta
+      beta_out[it, ] <- as.vector(beta)
       if (p_theta > 0) {
-        theta_out[it, ] <- theta
+        theta_out[it, ] <- as.vector(theta)
       }
       pi_out[it, ] <- pi
       cMove[it] <- move
@@ -1939,16 +2289,28 @@ relativeShiftMCMC_binomial <- function(y, X, Z = NULL, A, M, priors = c(5.0, 10.
       if ((!is.null(Xnew) && p_theta == 0) || (!is.null(Xnew) && !is.null(Znew) && p_theta > 0)) {
         if (k_leaf > 0) {
           if (p_theta > 0) {
-            prob_pred <- plogis(Xnew[, l_leaf, drop = FALSE] %*% t(beta_temp) + Znew %*% t(theta))
+            eta_pred <- as.vector(Xnew[, l_leaf, drop = FALSE] %*% beta_temp + Znew %*% theta)
           } else {
-            prob_pred <- plogis(Xnew[, l_leaf, drop = FALSE] %*% t(beta_temp))
+            eta_pred <- as.vector(Xnew[, l_leaf, drop = FALSE] %*% beta_temp)
           }
+          eta_pred <- pmin(pmax(eta_pred, -10), 10)
+          prob_pred <- 1 / (1 + exp(-eta_pred))
           ypred_out[, it] <- rbinom(ntest, 1, prob_pred)
+        } else {
+          if (p_theta > 0) {
+            eta_pred <- as.vector(Znew %*% theta)
+            prob_pred <- 1 / (1 + exp(-eta_pred))
+            ypred_out[, it] <- rbinom(ntest, 1, prob_pred)
+          } else {
+            ypred_out[, it] <- rbinom(ntest, 1, 0.5)
+          }
         }
       }
       it <- it + 1
     }
   }
+  
+  pb$terminate()
   
   # 4. FINAL RESULTS --------------------------------------------------------
   total_time <- proc.time() - start_time
@@ -1973,3 +2335,130 @@ relativeShiftMCMC_binomial <- function(y, X, Z = NULL, A, M, priors = c(5.0, 10.
     family = "binomial"
   ))
 }
+
+
+# R-hat (Gelman-Rubin diagnostic)
+compute_rhat <- function(samples) {
+  if (!require(posterior)) install.packages("posterior")
+  library(posterior)
+  
+  # Verifica che l'input sia una lista di catene
+  if (!is.list(samples)) {
+    stop("L'input deve essere una lista di catene MCMC!")
+  }
+  
+  n_chains <- length(samples)
+  n_iter <- length(samples[[1]])
+  
+  all_zero <- all(sapply(samples, function(chain) all(chain == 0)))
+  if (all_zero) {
+    return(1.0) 
+  }
+  
+  samples_array <- array(NA, dim = c(n_iter, n_chains, 1))
+  for (chain in 1:n_chains) {
+    samples_array[, chain, 1] <- samples[[chain]]
+  }
+  
+  draws <- as_draws_array(samples_array)
+  rhat_values <- rhat(draws)
+
+  if (is.nan(rhat_values[1]) || is.infinite(rhat_values[1])) {
+    return(1.0)
+  }
+  
+  return(rhat_values[1])
+}
+
+check_rhat_convergence <- function(rhat_vector, threshold = 1.1, target_proportion = 0.95, plot_hist = TRUE) {
+  converged_proportion <- mean(rhat_vector < threshold, na.rm = TRUE)
+  
+  has_converged <- converged_proportion >= target_proportion
+  
+  cat("Proportion of R-hat values below threshold:", round(converged_proportion, 4), "\n")
+  if (has_converged) {
+    cat("✅ CONVERGENCE ACHIEVED: At least", target_proportion * 100, "% of R-hat values are below", threshold, "\n")
+  } else {
+    cat("❌ CONVERGENCE NOT ACHIEVED: Less than", target_proportion * 100, "% of R-hat values are below", threshold, "\n")
+  }
+  
+  if (plot_hist) {
+    hist(rhat_vector, 
+         main = "Distribution of R-hat Values", 
+         xlab = "R-hat", 
+         col = "lightblue",
+         breaks = 20)
+    abline(v = threshold, col = "red", lwd = 2)
+    legend("topright", 
+           legend = paste("Threshold =", threshold), 
+           col = "red", 
+           lwd = 2, 
+           bty = "n")
+  }
+  
+  invisible(list(
+    converged_proportion = converged_proportion,
+    has_converged = has_converged,
+    threshold = threshold,
+    target_proportion = target_proportion
+  ))
+}
+
+
+compute_ess <- function(samples, method = "bulk") {
+  if (!require(posterior)) install.packages("posterior")
+  library(posterior)
+  
+  if (!is.list(samples)) {
+    stop("Input must be a list of MCMC chains!")
+  }
+  
+  if (!all(sapply(samples, is.vector))) {
+    stop("All chains must be vectors (scalar parameters)!")
+  }
+  
+  all_zero <- all(sapply(samples, function(chain) all(chain == 0)))
+  if (all_zero) {
+    n_total <- sum(sapply(samples, length))
+    warning("Parameter is constantly zero. Returning total sample size as ESS.")
+    return(n_total)
+  }
+  
+  n_chains <- length(samples)
+  n_iter <- length(samples[[1]])
+  
+  samples_array <- array(NA, dim = c(n_iter, n_chains, 1))
+  for (chain in 1:n_chains) {
+    samples_array[, chain, 1] <- samples[[chain]]
+  }
+  
+  draws <- as_draws_array(samples_array)
+  
+  tryCatch({
+    if (method == "bulk") {
+      ess_value <- ess_bulk(draws)
+    } else if (method == "tail") {
+      ess_value <- ess_tail(draws)
+    } else if (method == "mean") {
+      ess_value <- ess_mean(draws)
+    } else if (method == "sd") {
+      ess_value <- ess_sd(draws)
+    } else if (method == "median") {
+      ess_value <- ess_median(draws)
+    } else {
+      stop("Method must be one of: 'bulk', 'tail', 'mean', 'sd', 'median'")
+    }
+    
+    if (is.nan(ess_value[1]) || is.infinite(ess_value[1])) {
+      warning("ESS calculation resulted in NaN or Inf. Returning total sample size.")
+      return(sum(sapply(samples, length)))
+    }
+    
+    return(ess_value[1])
+  }, error = function(e) {
+    warning("Error in ESS calculation: ", e$message, ". Returning total sample size.")
+    return(sum(sapply(samples, length)))
+  })
+}
+
+
