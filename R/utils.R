@@ -1725,12 +1725,12 @@ relativeShiftMCMC_gaussian <- function(y, X, Z = NULL, A, M, priors = c(5.0, 10.
 }
 
 
-run_multiple_chains <- function(y, X, Z = NULL, A, M, priors = c(5.0, 10.0, 2.0, 2.0, 1.0, 1.0),
-                                N = 1, num_iter, num_burn, num_thin, 
-                                method = "OLS", gprior = FALSE, g = NULL,
-                                adaptive_levels = TRUE, tau = 0.5, kappa = 1,
-                                adaptive_moves = TRUE, lambda = 1,
-                                n_chains, parallel = TRUE, train_prop = 0.8, seed = NULL) {
+run_multiple_chains_gaussian <- function(y, X, Z = NULL, A, M, priors = c(5.0, 10.0, 2.0, 2.0, 1.0, 1.0),
+                                         N = 1, num_iter, num_burn, num_thin, 
+                                         method = "OLS", gprior = FALSE, g = NULL,
+                                         adaptive_levels = TRUE, tau = 0.5, kappa = 1,
+                                         adaptive_moves = TRUE, lambda = 1,
+                                         n_chains, parallel = TRUE, train_prop = 0.8, seed = NULL) {
   
   # Load required libraries
   if (!require(posterior)) install.packages("posterior")
@@ -1748,6 +1748,13 @@ run_multiple_chains <- function(y, X, Z = NULL, A, M, priors = c(5.0, 10.0, 2.0,
   
   # Run chains in parallel or sequentially
   chains <- foreach(i = 1:n_chains, .combine = 'c', .packages = c("mvtnorm", "MASS")) %dopar% {
+    
+    if(file.exists("R/utils.R")) {
+      source("R/utils.R")
+    } else {
+      warning("File 'R/utils.R' don't found in the expected path.")
+    }
+    
     # Set unique seed for each chain
     chain_seed <- if (!is.null(seed)) seed + i else NULL
     
@@ -1783,6 +1790,7 @@ run_multiple_chains <- function(y, X, Z = NULL, A, M, priors = c(5.0, 10.0, 2.0,
     result$X_test <- X_test
     result$y_test <- y_test
     result$Z_test <- Z_test
+    result$train_indices <- train_indices
     
     list(result)
   }
@@ -1796,30 +1804,47 @@ run_multiple_chains <- function(y, X, Z = NULL, A, M, priors = c(5.0, 10.0, 2.0,
   }
   
   params <- c("beta", "theta", "sigma")
+  
   samples_list <- lapply(params, function(p) {
     lapply(chains, function(chain) extract_samples(chain, p))
   })
   names(samples_list) <- params
   
-  # Compute Rhat and ESS for each parameter
   compute_diagnostics <- function(samples) {
-    n_iter <- nrow(samples[[1]])
-    n_params <- ifelse(is.matrix(samples[[1]]), ncol(samples[[1]]), 1)
+    if (is.null(samples) || length(samples) == 0 || is.null(samples[[1]])) return(NULL)
+    
+    chain1 <- as.matrix(samples[[1]]) 
+    n_iter <- nrow(chain1)
+    n_params <- ncol(chain1)
+    
     samples_array <- array(NA, dim = c(n_iter, n_chains, n_params))
     
-    for (chain in 1:n_chains) {
-      if (n_params > 1) {
-        samples_array[, chain, ] <- as.matrix(samples[[chain]])
-      } else {
-        samples_array[, chain, 1] <- samples[[chain]]
+    for (chain_idx in 1:n_chains) {
+      mat_data <- as.matrix(samples[[chain_idx]])
+      
+      if(nrow(mat_data) == n_iter && ncol(mat_data) == n_params) {
+        samples_array[, chain_idx, ] <- mat_data
       }
     }
     
-    draws <- posterior::as_draws_array(samples_array)
-    rhat <- posterior::rhat(draws)
-    ess <- posterior::ess_bulk(draws)
+    param_names <- colnames(samples[[1]])
+    if (is.null(param_names)) {
+      if(n_params == 1) param_names <- "param" 
+      else param_names <- paste0("p", 1:n_params)
+    }
+    dimnames(samples_array)[[3]] <- param_names
     
-    list(rhat = rhat, ess = ess)
+    draws <- posterior::as_draws_array(samples_array)
+    
+    tryCatch({
+      res <- posterior::summarise_draws(draws, 
+                                        posterior::rhat, 
+                                        posterior::ess_bulk,
+                                        posterior::ess_tail)
+      return(res)
+    }, error = function(e) {
+      return(list(error = paste("Diagnostics failed:", e$message)))
+    })
   }
   
   diagnostics <- lapply(samples_list, compute_diagnostics)
@@ -1932,7 +1957,7 @@ accept_binary <- function(Xold, Xnew, c, kappa_pg, r21, r12,
 }
 
 
-relativeShiftMCMC_binomial <- function(y, X, Z = NULL, A, M, priors = c(5.0, 10.0, 1.0, 1.0), 
+relativeShiftMCMC_binary <- function(y, X, Z = NULL, A, M, priors = c(5.0, 10.0, 1.0, 1.0), 
                                        N = 1, num_iter, num_burn, num_thin, 
                                        Xnew = NULL, Znew = NULL,
                                        seed = NULL, 
@@ -2462,3 +2487,126 @@ compute_ess <- function(samples, method = "bulk") {
 }
 
 
+run_multiple_chains_binary <- function(y, X, Z = NULL, A, M, priors = c(5.0, 10.0, 1.0, 1.0), 
+                                       N = 1, num_iter, num_burn, num_thin, 
+                                       adaptive_levels = TRUE, tau = 0.5, kappa = 1,
+                                       adaptive_moves = TRUE, lambda = 1,
+                                       n_chains, parallel = TRUE, train_prop = 0.8, seed = NULL) {
+  
+  # Load required libraries
+  if (!require(posterior)) install.packages("posterior")
+  if (!require(doParallel)) install.packages("doParallel")
+  library(posterior)
+  library(doParallel)
+  
+  # Set up parallel backend
+  if (parallel) {
+    n_cores <- min(n_chains, detectCores() - 1)
+    cl <- makeCluster(n_cores)
+    registerDoParallel(cl)
+    on.exit(stopCluster(cl))
+  }
+  
+  # Run chains in parallel or sequentially
+  chains <- foreach(i = 1:n_chains, .combine = 'c', .packages = c("mvtnorm", "MASS")) %dopar% {
+    
+    if(file.exists("R/utils.R")) {
+      source("R/utils.R")
+    } else {
+      warning("File 'R/utils.R' don't found in the expected path.")
+    }
+    
+    # Set unique seed for each chain
+    chain_seed <- if (!is.null(seed)) seed + i else NULL
+    
+    # Split data into training and test sets for this chain
+    n <- nrow(X)
+    n_train <- floor(train_prop * n)
+    
+    # Random split
+    train_indices <- sample(1:n, n_train)
+    
+    X_train <- X[train_indices, , drop = FALSE]
+    y_train <- y[train_indices]
+    X_test <- X[-train_indices, , drop = FALSE]
+    y_test <- y[-train_indices]
+    
+    if (!is.null(Z)) {
+      Z_train <- Z[train_indices, , drop = FALSE]
+      Z_test <- Z[-train_indices, , drop = FALSE]
+    } else {
+      Z_train <- NULL
+      Z_test <- NULL
+    }
+    
+    # Run MCMC on training data
+    result <- relativeShiftMCMC_binary(
+      y = y_train, X = X_train, Z = Z_train, A = A, M = M, priors = priors,
+      N = N, num_iter = num_iter, num_burn = num_burn, num_thin = num_thin,
+      Xnew = X_test, Znew = Z_test,
+      seed = chain_seed,
+      adaptive_levels = adaptive_levels, tau = tau, kappa = kappa,
+      adaptive_moves = adaptive_moves, lambda = lambda
+    )
+    
+    result$X_test <- X_test
+    result$y_test <- y_test
+    result$Z_test <- Z_test
+    result$train_indices <- train_indices
+    
+    list(result)
+  }
+  
+  extract_samples <- function(chain, param) {
+    switch(param,
+           "beta" = chain$beta,
+           "theta" = chain$theta)
+  }
+  
+  params <- c("beta", "theta")
+  
+  samples_list <- lapply(params, function(p) {
+    lapply(chains, function(chain) extract_samples(chain, p))
+  })
+  names(samples_list) <- params
+  
+  compute_diagnostics <- function(samples) {
+    if (is.null(samples) || length(samples) == 0 || is.null(samples[[1]])) return(NULL)
+    
+    chain1 <- as.matrix(samples[[1]]) 
+    n_iter <- nrow(chain1)
+    n_params <- ncol(chain1)
+    
+    samples_array <- array(NA, dim = c(n_iter, n_chains, n_params))
+    
+    for (chain_idx in 1:n_chains) {
+      mat_data <- as.matrix(samples[[chain_idx]])
+      
+      if(nrow(mat_data) == n_iter && ncol(mat_data) == n_params) {
+        samples_array[, chain_idx, ] <- mat_data
+      }
+    }
+    
+    param_names <- colnames(samples[[1]])
+    if (is.null(param_names)) {
+      param_names <- paste0("p", 1:n_params)
+    }
+    dimnames(samples_array)[[3]] <- param_names
+    
+    draws <- posterior::as_draws_array(samples_array)
+    
+    tryCatch({
+      res <- posterior::summarise_draws(draws, 
+                                        posterior::rhat, 
+                                        posterior::ess_bulk,
+                                        posterior::ess_tail)
+      return(res)
+    }, error = function(e) {
+      return(list(error = paste("Diagnostics failed:", e$message)))
+    })
+  }
+  
+  diagnostics <- lapply(samples_list, compute_diagnostics)
+  
+  return(list(chains = chains, diagnostics = diagnostics))
+}
